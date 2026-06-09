@@ -139,6 +139,58 @@ pub fn extract_text(path: &str, max_chars: usize) -> String {
     trimmed.trim().to_string()
 }
 
+/// Nº máximo de páginas que se envían como imagen a la IA multimodal.
+/// Acota el coste/tamaño de la petición; el texto extraído cubre el resto.
+const MAX_PDF_IMAGES: usize = 24;
+
+/// Renderiza las primeras `max_pages` páginas de un PDF a PNG y las devuelve
+/// como data-URIs (`data:image/png;base64,…`), listas para el endpoint
+/// multimodal de Gemini. Permite que la IA VEA ejercicios, figuras y fórmulas
+/// que el texto plano (pdftotext) pierde. Falla en silencio (vector vacío).
+pub fn render_pdf_images(path: &str, max_pages: usize) -> Vec<String> {
+    use base64::Engine;
+    let p = Path::new(path);
+    if p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("pdf".into()) {
+        return Vec::new();
+    }
+    // Carpeta temporal única (pid + nanos) para no pisar otras conversiones.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("aula_mm_{}_{}", std::process::id(), nanos));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Vec::new();
+    }
+    let prefix = dir.join("p");
+    // pdftoppm: PNG, ~120 dpi, escalado a 1240px de ancho (≈77 KB/página en base64).
+    let out = std::process::Command::new("pdftoppm")
+        .args([
+            "-png", "-r", "120", "-scale-to-x", "1240", "-scale-to-y", "-1",
+            "-f", "1", "-l", &max_pages.to_string(), path,
+            prefix.to_str().unwrap_or("p"),
+        ])
+        .output();
+    let mut imgs = Vec::new();
+    if matches!(out, Ok(ref o) if o.status.success()) {
+        // Recolecta los PNG generados en orden de página.
+        let mut pages: Vec<_> = std::fs::read_dir(&dir)
+            .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+                .collect())
+            .unwrap_or_default();
+        pages.sort();
+        for page in pages.iter().take(max_pages) {
+            if let Ok(bytes) = std::fs::read(page) {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                imgs.push(format!("data:image/png;base64,{}", b64));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    imgs
+}
+
 /// Clasifica un documento en una de las CATEGORIES usando Ollama (local),
 /// con respaldo por palabras clave del nombre + contenido.
 #[allow(dead_code)]
@@ -351,9 +403,13 @@ pub async fn detect_dates(cfg: &AppConfig, items: &[(String, String, String)]) -
 /// CONTEXTO LIMPIO: cada llamada es una petición independiente con un único
 /// mensaje de usuario (no hay historial compartido), así que un resumen NUNCA
 /// mezcla información de otro archivo.
-pub async fn summarize(cfg: &AppConfig, filename: &str, category: &str, text: &str) -> Result<String, String> {
-    if text.trim().is_empty() {
-        return Err("Sin texto extraíble para resumir (¿PDF escaneado o formato no soportado?).".into());
+pub async fn summarize(cfg: &AppConfig, filename: &str, category: &str, text: &str, path: &str) -> Result<String, String> {
+    // VISIÓN MULTIMODAL: renderizamos las páginas del PDF a imagen para que la IA
+    // VEA ejercicios, figuras y fórmulas (lo que pdftotext pierde). Esto vale
+    // incluso para PDFs escaneados, donde no hay texto extraíble.
+    let images = render_pdf_images(path, MAX_PDF_IMAGES);
+    if text.trim().is_empty() && images.is_empty() {
+        return Err("Sin texto ni páginas renderizables para resumir (¿formato no soportado?).".into());
     }
     let muestra: String = text.chars().take(28000).collect();
 
@@ -393,13 +449,30 @@ Resume este material de clase para estudiar:\n\
 ## Para repasar\n(2-3 preguntas de autoevaluación)",
     };
 
+    // Bloque de visión: solo cuando adjuntamos imágenes de las páginas.
+    let bloque_vision = if images.is_empty() {
+        ""
+    } else {
+        "\nADJUNTO las páginas del documento como IMÁGENES. Léelas con atención: \
+         contienen ejercicios, enunciados, figuras, diagramas, tablas y fórmulas que el \
+         texto extraído NO incluye o transcribe mal. Cuando un ejercicio o una figura \
+         aparezca solo en la imagen, TRANSCRÍBELO con fidelidad (incluidos los datos y \
+         valores numéricos) y, si procede, RESUÉLVELO paso a paso. Prioriza lo que ves en \
+         las imágenes frente al texto cuando haya discrepancia. Describe las figuras \
+         relevantes en palabras.\n"
+    };
+    let contenido = if muestra.trim().is_empty() {
+        "(sin texto extraíble; usa las imágenes adjuntas)".to_string()
+    } else {
+        muestra
+    };
     let prompt = format!(
-        "{instruccion}\n\n\
+        "{instruccion}\n{bloque_vision}\n\
          Escribe en español, en markdown, claro y bien estructurado.\n\
          Documento ({category}): {filename}\n\n\
-         Contenido:\n{muestra}"
+         Texto extraído (puede estar incompleto):\n{contenido}"
     );
-    cloud_complete(cfg, &prompt).await
+    cloud_complete_mm(cfg, &prompt, &images).await
 }
 
 /// Resumen GENERAL de un ramo para una categoría, a partir de los resúmenes
@@ -604,10 +677,34 @@ async fn cloud_complete(cfg: &AppConfig, prompt: &str) -> Result<String, String>
     cloud_chat(cfg, prompt, 0.4, false).await
 }
 
+/// Completion cloud MULTIMODAL: el prompt va acompañado de imágenes (data-URIs)
+/// de las páginas del PDF, para que la IA VEA ejercicios, figuras y fórmulas.
+/// Si no hay imágenes, equivale a `cloud_complete` (solo texto).
+async fn cloud_complete_mm(cfg: &AppConfig, prompt: &str, images: &[String]) -> Result<String, String> {
+    if images.is_empty() {
+        return cloud_complete(cfg, prompt).await;
+    }
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": prompt })];
+    for url in images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": url }
+        }));
+    }
+    cloud_chat_content(cfg, serde_json::Value::Array(parts), 0.4, false).await
+}
+
 /// Chat cloud (OpenAI-compat) ROBUSTO: usa el proveedor + clave de Nexo, con
 /// REINTENTOS y backoff ante errores transitorios (429 cuota, 503 saturación,
 /// timeouts). `json_mode` fuerza salida JSON (para clasificación fiable).
 async fn cloud_chat(cfg: &AppConfig, prompt: &str, temperature: f64, json_mode: bool) -> Result<String, String> {
+    cloud_chat_content(cfg, serde_json::Value::String(prompt.to_string()), temperature, json_mode).await
+}
+
+/// Igual que `cloud_chat` pero el `content` del mensaje puede ser una cadena
+/// (texto puro) o un array de partes OpenAI-compat (texto + imágenes), lo que
+/// habilita las peticiones multimodales a Gemini.
+async fn cloud_chat_content(cfg: &AppConfig, content: serde_json::Value, temperature: f64, json_mode: bool) -> Result<String, String> {
     let (openrouter, gemini) = config::nexo_keys();
     let (endpoint, key, extra_headers) = match cfg.summary_provider.as_str() {
         "gemini" => {
@@ -634,7 +731,7 @@ async fn cloud_chat(cfg: &AppConfig, prompt: &str, temperature: f64, json_mode: 
     };
     let mut body = serde_json::json!({
         "model": cfg.summary_model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": content}],
         "stream": false,
         "temperature": temperature,
     });

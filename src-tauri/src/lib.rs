@@ -728,7 +728,7 @@ async fn summarize_file(file_id: u64) -> Result<String, String> {
     let concluded = concluded_ids(&state).contains(&file.course_id);
     let folder = course_labels(&state).get(&file.course_id).cloned().unwrap_or_else(|| file.course_name.clone());
     let text = ai::extract_text(&file.local_path, 30000);
-    let summary = ai::summarize(&cfg, &file.filename, &file.category, &text).await?;
+    let summary = ai::summarize(&cfg, &file.filename, &file.category, &text, &file.local_path).await?;
     state.files[idx].summary = summary.clone();
     write_summary_file(&cfg, &file, &folder, concluded, &summary);
     store::save(&cfg.download_dir, &state)?;
@@ -766,7 +766,7 @@ async fn run_individual_summaries(cfg: &AppConfig, state: &mut AppState, on_even
         });
         let folder = labels.get(&file.course_id).cloned().unwrap_or_else(|| file.course_name.clone());
         let text = ai::extract_text(&file.local_path, 30000);
-        match ai::summarize(cfg, &file.filename, &file.category, &text).await {
+        match ai::summarize(cfg, &file.filename, &file.category, &text, &file.local_path).await {
             Ok(s) => { state.files[idx].summary = s.clone(); write_summary_file(cfg, &file, &folder, concluded, &s); }
             Err(e) => {
                 let _ = on_event.send(Progress::Log { message: format!("⚠ {}: {}", file.filename, e) });
